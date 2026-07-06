@@ -33,6 +33,7 @@ current_roll = 0.0
 current_pitch = 0.0
 current_altitude = 0.0
 current_groundspeed = 0.0
+current_airspeed = 0.0  # m/s true airspeed -- what the wing actually flies on (see request_data)
 current_onground = 1.0  # 1 = on ground, 0 = airborne
 current_pitch_rate = 0.0  # deg/s, positive = pitching up (assumed; verify if unsure)
 current_roll_rate = 0.0   # deg/s
@@ -49,6 +50,12 @@ DEFAULT_TARGET_ALTITUDE = 1500.0  # meters MSL (unused now that cruise is capped
 CRUISE_ALTITUDE_FT = 300.0
 FEET_TO_METERS = 0.3048
 CRUISE_ALTITUDE_M = CRUISE_ALTITUDE_FT * FEET_TO_METERS  # ~91.4m
+
+# Enroute cruise, same pitch-for-speed / power-for-path model as the approach:
+# the elevator holds CRUISE_SPEED_MS, and the throttle trims around a baseline
+# to hold the cruise altitude cap (add power to hold/climb, pull it to descend).
+CRUISE_SPEED_MS = 46.0       # ~90 kts -- comfortable 172 low-level cruise
+CRUISE_THROTTLE_TRIM = 0.55  # baseline power that roughly holds the cruise cap
 
 # ----------------------------
 # FLIGHT PHASE STATE MACHINE
@@ -77,6 +84,13 @@ GLIDESLOPE_DEG = 3.0                # standard 3-degree glideslope
 FLARE_ALT_AGL_M = 15.0              # height above runway to begin flare
 FLARE_PITCH_DEG = 4.0               # nose-up attitude during flare
 LANDED_GROUNDSPEED_MS = 2.0         # below this, consider the rollout complete
+
+# Cessna 172 final-approach targets (pitch-for-speed / power-for-path model).
+# Elevator holds APPROACH_SPEED_MS; throttle holds the glidepath around a
+# baseline trim setting. Retune these numbers for a different aircraft.
+APPROACH_SPEED_MS = 33.0           # ~64 kts -- 172 short-final speed
+APPROACH_FLAPS = 0.66              # ~20 deg -- partial flaps, NOT full; a 172 has no speedbrake
+APPROACH_THROTTLE_TRIM = 0.30      # baseline power that roughly holds a 3-deg glide at approach speed
 
 landing_runway = None   # dict: {icao, lat, lon, heading, elevation_m} once selected
 faf_point = None         # dict: {lat, lon} -- final approach fix, ahead of APPROACH entry
@@ -300,6 +314,7 @@ def request_data():
         (108, b"sim/flightmodel/failures/onground_any"),
         (109, b"sim/flightmodel/position/Q"),  # pitch rotation rate, deg/s
         (110, b"sim/flightmodel/position/P"),  # roll rotation rate, deg/s
+        (111, b"sim/flightmodel/position/true_airspeed"),  # m/s -- speed loop flies this, not groundspeed
     ]
     for idx, ref in refs:
         msg = struct.pack("<5sii400s", b"RREF\x00", 5, idx, ref + b"\x00")
@@ -311,7 +326,7 @@ def request_data():
 def autopilot():
     global current_lat, current_lon, current_heading
     global current_roll, current_pitch, current_altitude
-    global current_groundspeed, current_onground, current_pitch_rate, current_roll_rate
+    global current_groundspeed, current_airspeed, current_onground, current_pitch_rate, current_roll_rate
     global current_wp_index, flight_phase, runway_heading, takeoff_elevation
     global gear_is_down, landing_runway, faf_point, faf_inserted
 
@@ -350,6 +365,8 @@ def autopilot():
                 current_pitch_rate = value
             elif idx == 110:
                 current_roll_rate = value
+            elif idx == 111:
+                current_airspeed = value
             offset += 8
 
         with phase_lock:
@@ -502,18 +519,28 @@ def autopilot():
 
             wp_status = f"WP {current_wp_index}/{len(path)}" if path else "no path"
             print(f"[ENROUTE] Lat:{current_lat:.4f} Lon:{current_lon:.4f} "
-                  f"Head:{current_heading:.1f} Alt:{current_altitude:.0f} [{wp_status}]")
+                  f"Head:{current_heading:.1f} Alt:{current_altitude:.0f} Spd:{current_airspeed:.0f} [{wp_status}]")
 
-            send_throttle(0.0)
+            # Same model as APPROACH: elevator holds airspeed, throttle holds
+            # altitude. Descending by cutting throttle and pushing the nose
+            # down just trades height for speed and won't settle -- on this
+            # airframe it wouldn't come down at all. Let power do the vertical
+            # work instead.
 
-            alt_error = target_altitude - current_altitude
-            # Same fix as APPROACH: old gain (0.003) was too weak to reach
-            # the clamp ceiling even with large altitude errors.
-            pitch_target = 0.012 * alt_error
-            pitch_target = max(-10, min(8, pitch_target))
+            # THROTTLE -> altitude. Above the cruise cap: pull power off to
+            # sink; below it: add power to hold or climb back up.
+            alt_error = current_altitude - target_altitude   # +ve = above target
+            throttle = CRUISE_THROTTLE_TRIM - 0.01 * alt_error
+            throttle = max(0.0, min(1.0, throttle))
+            send_throttle(throttle)
+
+            # ELEVATOR -> airspeed. Holds a steady cruise speed so the wing
+            # keeps flying while the throttle moves us up or down.
+            speed_error = current_airspeed - CRUISE_SPEED_MS  # +ve = too fast
+            pitch_target = max(-8, min(8, 0.5 * speed_error))
             pitch_error = pitch_target - current_pitch
             elevator = 0.04 * pitch_error - 0.015 * current_pitch_rate
-            elevator = max(-1.0, min(0.4, elevator))  # full authority for pitch down
+            elevator = max(-0.4, min(0.4, elevator))
 
             if active_wp is not None:
                 desired_heading = get_heading_to_target(
@@ -541,11 +568,11 @@ def autopilot():
         # ============================================================
         if phase == "APPROACH":
             if gear_is_down is False:
-                print("Extending gear, setting landing flaps, deploying speedbrake")
+                print("Extending gear, setting approach flaps")
                 set_gear_down(True)
                 gear_is_down = True
-                set_flaps(2.0)
-                set_speedbrake(5.0)
+                set_flaps(APPROACH_FLAPS)   # partial flaps (0.0-1.0). Full flaps + full
+                set_speedbrake(0.0)          # speedbrake (the old 2.0/5.0) just mushed the wing.
 
             dist_to_threshold = get_distance_m(
                 current_lat, current_lon, landing_runway["lat"], landing_runway["lon"]
@@ -604,48 +631,36 @@ def autopilot():
             cruise_alt_msl = (takeoff_elevation or 0) + CRUISE_ALTITUDE_M
             target_altitude = min(landing_runway["elevation_m"] + glide_alt_agl, cruise_alt_msl)
 
-            # Bank-aware pitch correction: a banked aircraft sinks even at constant
-            # pitch (lift vector is tilted sideways). Pulling the nose up while
-            # banked tightens the turn instead of climbing -- this coupling is
-            # what causes a graveyard spiral (bank -> sink -> pull up -> tighter
-            # bank -> sink faster -> pull up harder...). Scale down how hard we
-            # chase altitude error while banked, and prioritize leveling the
-            # wings first.
-            bank_factor = max(0.2, math.cos(math.radians(current_roll)))
-            # Wider pitch-down authority than other phases -- final glide
-            # needs to be able to correct a high approach aggressively.
-            # Gain raised from 0.005 to 0.025: the old gain was mathematically
-            # too weak to ever reach the -20 degree ceiling even with a huge
-            # altitude error (e.g. -900m error only produced -4.6 degrees of
-            # pitch_target, and -0.25 elevator -- confirmed by hand-checking
-            # actual logged values). This is why the surface moved a little
-            # but never enough: the command was genuinely mild, not blocked.
-            pitch_target = max(-20, min(3, 0.025 * (target_altitude - current_altitude) * bank_factor))
-            pitch_error = pitch_target - current_pitch
-            elevator1 = 0.04 * pitch_error - 0.015 * current_pitch_rate
-            # Full authority, not a soft clamp -- the previous -0.5 ceiling was
-            # the actual bug: the command was saturating there every tick and
-            # never able to command more, which is why pitch plateaued around
-            # +1.8 degrees instead of actually diving. The manual test proved
-            # -1.0 dives cleanly once trim is zeroed, so match that here.
-            elevator2 = max(-1.0, min(0.2, elevator1))
-            send_elevator(elevator2)
+            # Vertical control uses the pitch-for-SPEED / power-for-PATH model.
+            # On a stabilised approach the elevator flies AIRSPEED and the
+            # throttle flies the GLIDEPATH -- the opposite of the intuitive
+            # "pitch down to descend", which just trades height for speed and
+            # balloons. Two decoupled loops instead of one control war.
 
-            # Idle power entirely once meaningfully above the glide profile --
-            # a lingering throttle floor (even 0.15) adds lift/speed that
-            # fights the dive. Only ease throttle back up once close to being
-            # on profile.
-            # Idle for the whole final glide, not just conditionally. Manual
-            # testing showed cutting throttle is what actually gets the nose
-            # down on this aircraft -- likely strong thrust-line pitch coupling
-            # fighting a partial-power elevator command the whole way down.
-            throttle = -0.6
+            # ELEVATOR -> airspeed. Too fast: raise the nose to bleed speed.
+            # Too slow: lower it. This keeps the wing flying instead of
+            # mushing, wherever we are on the glidepath.
+            speed_error = current_airspeed - APPROACH_SPEED_MS   # +ve = too fast
+            pitch_target = max(-8, min(8, 0.5 * speed_error))
+            pitch_error = pitch_target - current_pitch
+            elevator = 0.04 * pitch_error - 0.015 * current_pitch_rate
+            elevator = max(-0.4, min(0.4, elevator))
+            send_elevator(elevator)
+
+            # THROTTLE -> glidepath. Above the glideslope: pull power off and
+            # sink toward it; below it: add power. A baseline trim setting
+            # roughly holds the 3-degree slope at approach speed, so the plane
+            # settles onto the path instead of diving at it. Idle here also
+            # recovers a too-high approach without ever mushing.
+            alt_error = current_altitude - target_altitude       # +ve = above path
+            throttle = APPROACH_THROTTLE_TRIM - 0.01 * alt_error
+            throttle = max(0.0, min(0.6, throttle))
             send_throttle(throttle)
 
             agl = current_altitude - landing_runway["elevation_m"]
             print(f"[APPROACH] DistRemaining:{distance_remaining:.0f}m AlongTrack:{along_track:.0f}m "
                   f"CrossTrack:{cross_track:.0f}m AGL:{agl:.0f} TargetAlt:{target_altitude:.0f} "
-                  f"Pitch:{current_pitch:.1f} Roll:{current_roll:.1f} Elevator:{elevator:.2f} "
+                  f"Spd:{current_airspeed:.0f} Pitch:{current_pitch:.1f} Roll:{current_roll:.1f} Elevator:{elevator:.2f} "
                   f"Throttle:{throttle:.2f} Hdg:{current_heading:.0f} HdgTarget:{desired_heading:.0f}")
 
             # GO-AROUND: if we've flown past the threshold (along_track turns
@@ -682,7 +697,7 @@ def autopilot():
         # PHASE: FLARE -- cut power, hold nose up, track runway heading
         # ============================================================
         if phase == "FLARE":
-            send_throttle(-0.6)
+            send_throttle(0.0)  # throttle to idle for the flare -- not reverse
 
             pitch_error = FLARE_PITCH_DEG - current_pitch
             elevator1 = 0.04 * pitch_error - 0.015 * current_pitch_rate
